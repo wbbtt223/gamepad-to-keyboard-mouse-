@@ -1,0 +1,134 @@
+{
+  "enabled": true,
+  "rapid_hz": 20.0,
+  "double_click_gap": 0.04,
+  "hotkey": {
+    "enabled": true,
+    "key": "f12",
+    "ctrl": true
+  },
+  "voice_hotkey": "win+h",
+  "mouse": {
+    "stick": "left",
+    "sensitivity": 1400.0,
+    "deadzone": 0.18,
+    "exponent": 1.6,
+    "invert_y": false,
+    "right_stick_scroll": false,
+    "right": {
+      "mouse": true,
+      "sensitivity": 500.0,
+      "deadzone": 0.18,
+      "exponent": 1.8,
+      "invert_y": false
+    },
+    "scroll": {
+      "axis": 3,
+      "speed": 6.0,
+      "deadzone": 0.22,
+      "exponent": 1.9,
+      "linear_mix": 0.3,
+      "smooth": 0.25,
+      "limit": 4,
+      "invert": false
+    }
+  },
+  "buttons": {
+    "0": {
+      "action": "mouse_left",
+      "mode": "tap",
+      "hz": 20,
+      "key": ""
+    },
+    "1": {
+      "action": "mouse_right",
+      "mode": "tap",
+      "hz": 20,
+      "key": ""
+    },
+    "2": {
+      "action": "mouse_double",
+      "mode": "tap",
+      "hz": 20,
+      "key": ""
+    },
+    "3": {
+      "action": "mouse_middle",
+      "mode": "tap",
+      "hz": 20,
+      "key": ""
+    },
+    "4": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 20,
+      "key": "esc"
+    },
+    "5": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 20,
+      "key": "r"
+    },
+    "6": {
+      "action": "toggle",
+      "mode": "tap",
+      "hz": 20,
+      "key": ""
+    },
+    "7": {
+      "action": "voice",
+      "mode": "tap",
+      "hz": 20,
+      "key": ""
+    },
+    "8": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 20,
+      "key": "tab"
+    },
+    "9": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 20,
+      "key": "enter"
+    },
+    "10": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 20,
+      "key": "space"
+    },
+    "11": {
+      "action": "key",
+      "mode": "rapid",
+      "hz": 15,
+      "key": "space"
+    },
+    "100": {
+      "action": "wheel_up",
+      "mode": "rapid",
+      "hz": 6,
+      "key": ""
+    },
+    "101": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 1.2,
+      "key": "right"
+    },
+    "102": {
+      "action": "wheel_down",
+      "mode": "rapid",
+      "hz": 6,
+      "key": ""
+    },
+    "103": {
+      "action": "key",
+      "mode": "tap",
+      "hz": 1.2,
+      "key": "left"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 运行时产物 ----
+# 程序运行时写回的配置因人而异，想提交自己的键位就删掉这行
+config.local.json
+
+# 临时 / 测试输出
+_run*.txt
+_gh.txt
+_pagechk.py
+*.log
