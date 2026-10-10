@@ -85,6 +85,8 @@ def test_double_click():
 
 def test_rapid():
     cfg = mk({"0": {"action": "mouse_left", "mode": "rapid", "hz": 50, "key": ""}})
+    # 本测试只验「频率」：关掉启动延迟，否则前 0.4s 属于延迟期（只触发 1 次）
+    cfg["rapid_delay"] = 0.0
     r = Rec(); e = G.Engine(cfg, r); e.start()
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < 0.5:
@@ -104,8 +106,32 @@ def test_hold_mouse():
     assert len(r.of("down")) == 1 and len(r.of("up")) == 1, r.events
     print("PASS hold-mouse (按下保持/松开释放)")
 
+def test_a_button_default_is_hold():
+    """A(0) 默认必须是「按住不放」：快点一下=单击，长按=左键保持按下。
+    若被改回 tap，长按会完全失效（用户报过「A 键没办法长按」）。"""
+    d = G.default_config()
+    assert d["buttons"]["0"]["action"] == "mouse_left", d["buttons"]["0"]
+    assert d["buttons"]["0"]["mode"] == "hold", d["buttons"]["0"]
+    c = G.load_config()
+    assert c["buttons"]["0"]["action"] == "mouse_left", c["buttons"]["0"]
+    assert c["buttons"]["0"]["mode"] == "hold", c["buttons"]["0"]
+    print("PASS A(0) 默认 = 鼠标左键 + 按住不放（tap 会让长按失效）")
+
+def test_a_hold_long_press_holds_left_button():
+    """行为验证：A 长按期间左键保持按下（只按下 1 次），松手才释放。"""
+    cfg = mk({"0": {"action": "mouse_left", "mode": "hold", "hz": 20, "key": ""}})
+    r = Rec(); e = G.Engine(cfg, r); e.start()
+    e.update({0: True})
+    for _ in range(10):
+        e.update({0: True}); time.sleep(0.005)
+    e.update({0: False})
+    assert r.of("down") == [("down", "left")], r.events
+    assert r.of("up") == [("up", "left")], r.events
+    print("PASS A 长按 = 左键保持按下，松手释放")
+
 def test_key_rapid():
     cfg = mk({"11": {"action": "key", "mode": "rapid", "hz": 40, "key": "space"}})
+    cfg["rapid_delay"] = 0.0     # 同上：只验频率
     r = Rec(); e = G.Engine(cfg, r); e.start()
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < 0.4:
@@ -116,6 +142,44 @@ def test_key_rapid():
     assert 10 <= n <= 26, n
     assert all(x[1] == 0x20 for x in r.of("keytap"))
     print("PASS rapid-key 'space'  0.4s -> %d 次 (40Hz)" % n)
+
+def test_rapid_hold_delay():
+    """连发「启动延迟」：点一下只触发 1 次，按住超过延迟才连续触发。
+
+    真实故障：Y=退格 用 rapid，点一下却删了 3 个字母（按下即连发，几十毫秒就补发 2~3 次）。
+    修法：按下后先等 rapid_delay，延迟内松手只发第一次。
+    """
+    cfg = mk({"3": {"action": "key", "mode": "rapid", "hz": 20, "key": "backspace"}})
+    d = G.default_config()
+    assert d.get("rapid_delay") == 0.4, d.get("rapid_delay")   # 默认必须有延迟
+
+    r = Rec(); e = G.Engine(cfg, r); e.start()
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 0.10:                     # 快按 0.1s << 0.4s
+        e.update({3: True}); time.sleep(0.004)
+    e.update({3: False})
+    tap = len(r.of("keytap"))
+    assert tap == 1, "点一下应只触发 1 次，实际 %d" % tap
+
+    r2 = Rec(); e2 = G.Engine(cfg, r2); e2.start()
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 1.00:                     # 按住 1.0s
+        e2.update({3: True}); time.sleep(0.004)
+    e2.update({3: False})
+    hold = len(r2.of("keytap"))
+    assert hold >= 8, "按住 1s 应连续触发多次，实际 %d" % hold
+
+    # 延迟设 0 = 旧行为：0.1s 也会补发多次
+    cfg0 = dict(cfg); cfg0["rapid_delay"] = 0.0
+    r3 = Rec(); e3 = G.Engine(cfg0, r3); e3.start()
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 0.10:
+        e3.update({3: True}); time.sleep(0.004)
+    e3.update({3: False})
+    old = len(r3.of("keytap"))
+    assert old > 1, "delay=0 时应恢复「按下即连发」，实际 %d" % old
+    print("PASS rapid 启动延迟：点一下 %d 次 / 按住 1s %d 次 / delay=0 点一下 %d 次"
+          % (tap, hold, old))
 
 def test_toggle():
     cfg = mk({"6": {"action": "toggle", "mode": "tap", "hz": 20, "key": ""},
@@ -910,6 +974,166 @@ def test_config_roundtrip():
     assert back["buttons"]["0"]["action"] == "mouse_left"
     os.remove(p)
     print("PASS 配置读写")
+
+
+# ---------- 手柄「待机后假连接」自愈 ----------
+
+class _FakeXI(object):
+    """XInput 探针替身：可编程返回「连了哪个槽位 / 有没有按键」。"""
+    available = True
+
+    def __init__(self, slot, buttons=0, usable=True):
+        self.slot, self.buttons, self.usable = slot, buttons, usable
+
+    def read(self):
+        if not self.usable:
+            return None, None          # 探针不可用
+        if self.slot is None:
+            return None, {}            # 明确「一个都没连」
+        return self.slot, {"packet": 1, "buttons": self.buttons}
+
+
+def _mkpad(name, xi, seen=False):
+    p = G.Gamepad.__new__(G.Gamepad)
+    p.js = object()                    # 假装握着句柄
+    p.name = name
+    p.xinput = xi
+    p.stale = False
+    p._stale_since = 0.0
+    p._xinput_seen = seen
+    p.last_error = ""
+    return p
+
+
+XBOX_NAME = "Controller (XBOX 360 For Windows)"
+
+
+def test_stale_xinput_says_no_device():
+    """XInput 说一个都没连、SDL 却说连着 → 持续后判定为假连接。"""
+    p = _mkpad(XBOX_NAME, _FakeXI(None), seen=True)
+    p._check_stale({})
+    assert p.stale is False, "第一帧只记时间，不该立刻下结论"
+    p._stale_since = time.time() - 1.0
+    p._check_stale({})
+    assert p.stale is True, "异常持续超过确认时间后应判定假连接"
+    assert p.last_error
+    print("PASS 假连接判定：XInput 看不见设备")
+
+
+def test_stale_requires_prior_connection():
+    """从没被 XInput 看见过的手柄（可能本就不支持 XInput）不能误判。"""
+    p = _mkpad(XBOX_NAME, _FakeXI(None), seen=False)
+    p._stale_since = time.time() - 5.0
+    p._check_stale({})
+    assert p.stale is False, "没有'曾经连过'的证据就不该下结论"
+    print("PASS 假连接判定：缺乏证据时保持沉默")
+
+
+def test_stale_xinput_has_buttons_sdl_dead():
+    """XInput 有按键、SDL 一个键都没收到 → 句柄失效。"""
+    p = _mkpad(XBOX_NAME, _FakeXI(0, buttons=0x1000))
+    p._check_stale({})
+    assert p.stale is False, "单帧不判定"
+    p._stale_since = time.time() - 1.0
+    p._check_stale({})
+    assert p.stale is True
+    print("PASS 假连接判定：XInput 有按键而 SDL 死寂")
+
+
+def test_stale_never_false_positive_on_idle():
+    """手柄静止时轴读数乱跳，也绝不能被判成假连接（本机克隆手柄实测如此）。"""
+    for _ in range(50):
+        p = _mkpad(XBOX_NAME, _FakeXI(0, buttons=0))
+        p._stale_since = time.time() - 3.0
+        p._check_stale({})
+        assert p.stale is False, "静止 + 轴漂移不该触发误报"
+    print("PASS 假连接判定：静止/轴漂移免疫")
+
+
+def test_stale_ignores_non_xbox_and_unavailable_probe():
+    p = _mkpad("Generic USB Joystick", _FakeXI(None), seen=True)
+    p._stale_since = time.time() - 5.0
+    p._check_stale({})
+    assert p.stale is False, "非 Xbox 手柄不参与判定"
+    p = _mkpad(XBOX_NAME, _FakeXI(None, usable=False), seen=True)
+    p._stale_since = time.time() - 5.0
+    p._check_stale({})
+    assert p.stale is False, "探针不可用时不得下结论"
+    print("PASS 假连接判定：只对 Xbox 类手柄、且探针可用时才生效")
+
+
+class _FakePad(object):
+    available = True
+
+    def __init__(self, connected=True, stale=False):
+        self.connected, self.stale = connected, stale
+        self.calls = []
+
+    def rescan(self):
+        self.calls.append("rescan")
+        self.stale = False
+        return 1
+
+    def deep_reset(self):
+        self.calls.append("deep_reset")
+        self.stale = False
+        return 1
+
+
+def test_supervise_pad_ladder():
+    """假连接：先轻量重扫，再升级重建；并遵守退避。"""
+    pad = _FakePad(connected=True, stale=True)
+    st = {}
+    G.supervise_pad(pad, st)
+    assert pad.calls == ["rescan"], pad.calls
+    pad.stale = True
+    st["next_recover"] = 0.0
+    G.supervise_pad(pad, st)
+    assert pad.calls == ["rescan", "deep_reset"], pad.calls
+    pad.stale = True
+    st["next_recover"] = time.time() + 5.0
+    n = len(pad.calls)
+    G.supervise_pad(pad, st)
+    assert len(pad.calls) == n, "退避期内不该再动手"
+    print("PASS 守护策略：重扫 → 重建 pygame → 退避")
+
+
+def test_supervise_pad_other_states():
+    """未连接：每 2 秒扫一次；正常空闲：心跳重枚举；有输入：不打扰。"""
+    pad = _FakePad(connected=False, stale=False)
+    st = {}
+    G.supervise_pad(pad, st)
+    assert pad.calls == ["rescan"], pad.calls
+    st["last_scan"] = time.time()
+    G.supervise_pad(pad, st)
+    assert pad.calls == ["rescan"], "2 秒内不该重复扫"
+
+    pad = _FakePad(connected=True, stale=False)
+    st = {"last_input": time.time() - 30, "last_idle": time.time() - 30}
+    G.supervise_pad(pad, st)
+    assert pad.calls == ["rescan"], "长时间空闲应心跳重枚举"
+    st["last_idle"] = time.time()
+    G.supervise_pad(pad, st)
+    assert pad.calls == ["rescan"], "不该每帧都重枚举"
+
+    pad = _FakePad(connected=True, stale=False)
+    st = {"last_input": time.time(), "last_idle": 0.0}
+    G.supervise_pad(pad, st)
+    assert pad.calls == [], "正在使用手柄时不该动它"
+    print("PASS 守护策略：未连接/空闲/使用中三种情况")
+
+
+def test_pad_input_seen():
+    class _P(object):
+        buttons = {0: False}
+        axes = [0.0, 0.0]
+    assert G.pad_input_seen(_P()) is False
+    _P.buttons = {0: True}
+    assert G.pad_input_seen(_P()) is True
+    _P.buttons = {0: False}
+    _P.axes = [0.0, 0.9]
+    assert G.pad_input_seen(_P()) is True
+    print("PASS pad_input_seen：按键/摇杆/静止")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 {
   "enabled": true,
   "rapid_hz": 20.0,
+  "rapid_delay": 0.4,
   "double_click_gap": 0.04,
   "hotkey": {
     "enabled": true,
@@ -36,7 +37,7 @@
   "buttons": {
     "0": {
       "action": "mouse_left",
-      "mode": "tap",
+      "mode": "hold",
       "hz": 20,
       "key": ""
     },
@@ -53,10 +54,10 @@
       "key": ""
     },
     "3": {
-      "action": "mouse_middle",
-      "mode": "tap",
+      "action": "key",
+      "mode": "rapid",
       "hz": 20,
-      "key": ""
+      "key": "backspace"
     },
     "4": {
       "action": "key",

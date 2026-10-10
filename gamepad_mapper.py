@@ -31,7 +31,11 @@ import sys
 import time
 
 APP_NAME = "Gamepad Mapper"
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # PyInstaller 单文件模式：__file__ 指向临时解压目录，改用 exe 所在目录
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 DPAD_BASE = 100
@@ -378,6 +382,85 @@ class InputSimulator(object):
 # 4. 手柄读取 (pygame)
 # ============================================================================
 
+# --- 「假连接」自愈 ---------------------------------------------------------
+# 症状：手柄长时间待机（或电脑睡眠唤醒）后按什么都没反应，连重启本程序都没用。
+# 原因：设备节点在 Windows 里还挂着，SDL/pygame 又打开了一个**已经失效的句柄**，
+#       get_button() 照样正常返回（全是 False），于是程序永远以为「已连接」，
+#       也就永远不去重连 —— 而重启程序只是把同一个坏节点重新打开一遍。
+#
+# 判断办法：XInput 走的是 XUSB 驱动，和 SDL 的 HIDAPI 是两条完全独立的路径。
+# 把手柄当"测谎仪"用来交叉验证：
+#   · XInput 说「一个槽位都没连通」而 SDL 说「已连接」 → SDL 是假连接
+#   · XInput 有按键动作、SDL 却一片死寂            → SDL 句柄已失效
+STALE_CONFIRM_SECONDS = 0.6    # 上述异常要持续这么久才认定，避免误判
+STALE_RETRY_SECONDS = 1.5      # 假连接时两次自愈尝试的间隔
+IDLE_RESCAN_SECONDS = 6.0      # 连续空闲这么久，就顺手重枚举一次手柄
+
+
+class _XINPUT_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwPacketNumber", ctypes.c_ulong),
+        ("wButtons", ctypes.c_ushort),
+        ("bLeftTrigger", ctypes.c_ubyte),
+        ("bRightTrigger", ctypes.c_ubyte),
+        ("sThumbLX", ctypes.c_short),
+        ("sThumbLY", ctypes.c_short),
+        ("sThumbRX", ctypes.c_short),
+        ("sThumbRY", ctypes.c_short),
+    ]
+
+
+class XInputProbe(object):
+    """只读探针：Windows 上 Xbox 类手柄"是不是真的在连着"。
+
+    非 Windows 或系统没有 xinput DLL 时永远 available=False，此时所有判断都会
+    被跳过（绝不能让探针本身成为误判来源）。
+    """
+
+    def __init__(self):
+        self.dll = None
+        self.fn = None
+        if os.name != "nt":
+            return
+        for dll_name in ("xinput1_4", "xinput1_3", "xinput9_1_0"):
+            try:
+                dll = ctypes.WinDLL(dll_name)
+                fn = dll.XInputGetState
+                fn.argtypes = [ctypes.c_ulong, ctypes.POINTER(_XINPUT_STATE)]
+                fn.restype = ctypes.c_ulong
+                self.dll, self.fn = dll, fn
+                break
+            except Exception:
+                continue
+
+    @property
+    def available(self):
+        return self.fn is not None
+
+    def read(self):
+        """返回 (slot, state)。
+
+        slot=None + state=None → 探针不可用，调用方不要下结论；
+        slot=None + state={}   → 探针可用，且明确「没有任何手柄连通」；
+        slot=0..3             → 该槽位连通，state 里带 buttons / active。
+        """
+        if self.fn is None:
+            return None, None
+        for slot in range(4):
+            st = _XINPUT_STATE()
+            try:
+                rc = self.fn(slot, ctypes.byref(st))
+            except Exception:
+                return None, None
+            if rc == 0:
+                # 只用 wButtons 判断"有没有动作"，轴一律不参与比对：
+                # 实测这只克隆手柄的摇杆在 XInput 里静止时读数在 ±29000 乱跳，
+                # 而 SDL 里读到的是 0 —— 两者轴映射完全不同，拿轴比对必然误判。
+                return slot, {"packet": st.dwPacketNumber,
+                              "buttons": st.wButtons}
+        return None, {}
+
+
 class Gamepad(object):
     """轮询手柄状态。buttons 用虚拟索引，十字键在 100+。"""
 
@@ -397,6 +480,11 @@ class Gamepad(object):
         self.axes = []
         self.hats = []
         self._pump_ok = False
+        self.xinput = XInputProbe()
+        self.stale = False          # True = 句柄假连接（XInput 判定）
+        self.recover_count = 0      # 累计自愈次数（面板上显示）
+        self._stale_since = 0.0
+        self._xinput_seen = False   # 本次运行中 XInput 是否至少连通过一次
         self._init_pygame()
 
     def _init_pygame(self):
@@ -407,27 +495,42 @@ class Gamepad(object):
         except Exception as exc:
             self.error = ("缺少 pygame：%s\n请先安装：  pip install pygame" % exc)
             return
+        # 让 SDL 在没有窗口 / 窗口失焦时也照常处理手柄（后台常驻时更稳）。
+        # 必须在 pygame.init() 之前设置，SDL 初始化时会读这个 hint。
+        os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
         try:
             self.pygame.init()
             self.pygame.joystick.init()
         except Exception as exc:
             self.error = "pygame 初始化失败：%s" % exc
             return
+        if not self._start_events():
+            return
+        self.available = True
+        self.rescan()
+
+    def _start_events(self):
+        """启动 SDL 事件子系统。
+
+        没有窗口时 event.pump() 可能直接报错，就退化成开一个 1x1 的隐藏窗口；
+        两种都不行才算失败。deep_reset() 重建 pygame 后需要重跑这一段。
+        """
         try:
             self.pygame.event.pump()
             self._pump_ok = True
+            return True
         except Exception:
-            try:
-                self.pygame.display.init()
-                self.pygame.display.set_mode(
-                    (1, 1), getattr(self.pygame, "HIDDEN", 0))
-                self.pygame.event.pump()
-                self._pump_ok = True
-            except Exception as exc:
-                self.error = "SDL 事件子系统不可用：%s" % exc
-                return
-        self.available = True
-        self.rescan()
+            pass
+        try:
+            self.pygame.display.init()
+            self.pygame.display.set_mode(
+                (1, 1), getattr(self.pygame, "HIDDEN", 0))
+            self.pygame.event.pump()
+            self._pump_ok = True
+            return True
+        except Exception as exc:
+            self.error = "SDL 事件子系统不可用：%s" % exc
+            return False
 
     def _count(self):
         try:
@@ -438,6 +541,16 @@ class Gamepad(object):
     def rescan(self):
         if not self.available:
             return 0
+        # 关键：先把旧句柄丢掉再 quit。不丢的话 SDL 内部仍持有那个已经失效的
+        # 设备对象，quit/init 之后拿回来的还是同一个坏句柄 —— 重扫等于白扫，
+        # 这正是「待机后没反应、重启程序也没用」的原因。
+        old = self.js
+        self.js = None
+        self._stale_since = 0.0
+        try:
+            del old
+        except Exception:
+            pass
         try:
             self.pygame.joystick.quit()
             self.pygame.joystick.init()
@@ -483,6 +596,92 @@ class Gamepad(object):
             self.error = "打开手柄失败：%s" % exc
             return False
 
+    def deep_reset(self):
+        """动大手术：把 pygame（连带 SDL 手柄子系统）整个拆掉重建，再重新枚举。
+
+        rescan() 救不回来时用它 —— 特别是「SDL 连设备都枚举不到、XInput 明明
+        说手柄在线」那种情况（SDL 的枚举缓存已经烂了，只有整栈重建才认新设备）。
+        """
+        if self.pygame is None:
+            return 0
+        self.recover_count += 1
+        self.js = None
+        self._stale_since = 0.0
+        self.stale = False
+        try:
+            self.pygame.joystick.quit()
+        except Exception:
+            pass
+        try:
+            self.pygame.quit()
+        except Exception:
+            pass
+        try:
+            time.sleep(0.25)     # 给驱动一点时间真正释放设备
+        except Exception:
+            pass
+        try:
+            self.pygame.init()
+            self.pygame.joystick.init()
+        except Exception as exc:
+            self.error = "pygame 重新初始化失败：%s" % exc
+            return 0
+        if not self._start_events():
+            return 0
+        self.available = True
+        n = self.rescan()
+        if n:
+            self.last_error = ""
+        return n
+
+    def _is_xbox_like(self):
+        n = (self.name or "").lower()
+        return ("xbox" in n) or ("xinput" in n) or ("360" in n)
+
+    def _check_stale(self, buttons):
+        """用 XInput 交叉验证 SDL 读数，判断当前句柄是不是「假连接」。
+
+        只在「手柄名像 Xbox + XInput 探针可用」时才下结论，避免误伤杂牌手柄；
+        并且要求异常持续 STALE_CONFIRM_SECONDS，防止偶发抖动引发误判。
+        """
+        self.stale = False
+        # getattr 兜底：测试里会用 __new__ 直接构造 Gamepad（不走 __init__）
+        probe = getattr(self, "xinput", None)
+        if self.js is None or probe is None or not probe.available \
+                or not self._is_xbox_like():
+            self._stale_since = 0.0
+            return
+
+        xslot, xstate = probe.read()
+        if xstate is None:                  # 探针本身不可用 → 不下结论
+            self._stale_since = 0.0
+            return
+
+        bad = False
+        if xslot is None:
+            # XInput 明确说「一个手柄都没连」，SDL 却还"连着"。
+            # 只有本次运行中确实连通过，才敢判定是假连接 ——
+            # 否则可能只是这只手柄本来就不被 XInput 支持。
+            bad = getattr(self, "_xinput_seen", False)
+        else:
+            self._xinput_seen = True
+            # XInput 看到有按键按下、SDL 却一个键都没收到 → 句柄失效。
+            # 只看按键位掩码，不看轴：杂牌手柄在两条路径上的轴读数完全对不上。
+            if xstate.get("buttons"):
+                bad = not any(buttons.values())
+
+        if bad:
+            now = time.time()
+            since = getattr(self, "_stale_since", 0.0)
+            if not since:
+                self._stale_since = now
+            elif now - since >= STALE_CONFIRM_SECONDS:
+                self.stale = True
+                self.last_error = ("手柄「假连接」：XInput 能看见它、SDL 收不到输入，"
+                                   "正在自动重连…")
+        else:
+            self._stale_since = 0.0
+
     @property
     def connected(self):
         return self.js is not None
@@ -521,17 +720,16 @@ class Gamepad(object):
                 hats.append((0, 0))
 
         if self.nbuttons > 0 and got == 0:
-            # 句柄失效（例如 joystick 子系统被重新初始化），尝试自动重连
-            self.last_error = "手柄句柄失效，正在重连…"
+            # 所有按钮都读失败 → 句柄已死。只打标记，交给守护逻辑按退避策略重连；
+            # 在这里直接 rescan 会退化成每秒几百次的紧循环。
+            self.stale = True
+            self.last_error = "手柄句柄已失效，正在自动重连…"
             self.buttons, self.axes, self.hats = {}, [], []
-            try:
-                self.rescan()
-            except Exception:
-                pass
             return
         self.last_error = ""
 
         self.buttons, self.axes, self.hats = buttons, axes, hats
+        self._check_stale(buttons)
         for h, value in enumerate(self.hats):
             hx, hy = value
             base = DPAD_BASE + h * 4
@@ -556,6 +754,78 @@ class Gamepad(object):
         for h in range(self.nhats):
             ids.extend([DPAD_BASE + h * 4 + d for d in range(4)])
         return ids
+
+
+def supervise_pad(pad, state):
+    """手柄守护：把「未连接 / 假连接 / 长时间空闲」三类情况的重连统一在这里处理。
+
+    state 是一个 dict，用来在两次调用之间保存计时与重试次数。
+
+    这里是本次问题的核心 —— 原来的主循环只在 `pad.connected` 为假时才重扫，
+    而「待机假连接」时 connected 永远为真，于是重扫永远不会发生，表现就是
+    "按什么都没反应，重启软件也没用"。
+
+    返回 True 表示这次动过手柄（调用方可以顺手刷新面板）。
+    """
+    if not pad.available:
+        return False
+    now = time.time()
+
+    # ---- 1) 假连接：重扫 → 重建 pygame，且带退避，别把 CPU 烧了 ----
+    if pad.connected and pad.stale:
+        if now >= state.get("next_recover", 0.0):
+            tries = state.get("tries", 0) + 1
+            state["tries"] = tries
+            # 第 1 次先轻量重扫；第 2 次起直接重建整个 pygame
+            if tries <= 1:
+                pad.rescan()
+            else:
+                pad.deep_reset()
+            if tries >= 6:
+                # 连试 6 次都没救回来（多半是设备节点在系统层卡死）→ 退避，
+                # 面板上会显示"假连接"提示，等用户点「重置手柄驱动」。
+                state["tries"] = 0
+                state["next_recover"] = now + 12.0
+            else:
+                state["next_recover"] = now + STALE_RETRY_SECONDS
+        return True
+
+    state["tries"] = 0
+    state["next_recover"] = 0.0
+
+    # ---- 2) 正常连接：长时间没输入就做一次心跳重枚举 ----
+    # 目的是换掉「睡死了但 SDL 自己不知道」的句柄：这种情况 XInput 也可能
+    # 一起失联，靠上面的判定抓不到，只能靠定期重枚举兜底。
+    if pad.connected:
+        if (now - state.get("last_input", 0.0) >= IDLE_RESCAN_SECONDS
+                and now - state.get("last_idle", 0.0) >= IDLE_RESCAN_SECONDS):
+            state["last_idle"] = now
+            pad.rescan()
+            return True
+        return False
+
+    # ---- 3) 真的没连接：每 2 秒扫一次，等手柄回来 ----
+    if now - state.get("last_scan", 0.0) >= 2.0:
+        state["last_scan"] = now
+        pad.rescan()
+        return True
+    return False
+
+
+def pad_input_seen(pad):
+    """这一帧有没有手柄输入（用来更新「空闲计时」）。"""
+    try:
+        if any(pad.buttons.values()):
+            return True
+    except Exception:
+        pass
+    try:
+        for a in pad.axes:
+            if abs(float(a)) > 0.2:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # ============================================================================
@@ -584,6 +854,11 @@ VOICE_HOTKEY = "win+h"
 # 语音输入的最小触发间隔：防止误设成「连发」时把听写面板刷爆
 VOICE_MIN_INTERVAL = 0.35
 
+# 连发「启动延迟」默认值(秒)：按下后先等这么久才开始连续补发。
+# 作用是把「点一下」和「按住」区分开 —— 没有它，一次快速点按也会连发 2~3 次
+# （真实踩过：Y=退格，只想删一个字却删了 3 个）。0.4 接近 Windows 键盘重复延迟的手感。
+RAPID_HOLD_DELAY = 0.4
+
 MODE_CHOICES = [
     ("按一下", "tap"),
     ("按住不放", "hold"),
@@ -598,6 +873,9 @@ def default_config():
     return {
         "enabled": True,
         "rapid_hz": 20.0,
+        # 连发启动延迟(秒)：按住超过这么久才开始连续触发。
+        # 0.4 = 点一下只触发 1 次、按住 0.4 秒后开始连续（可在面板「连点/连发」里调）
+        "rapid_delay": 0.4,
         "double_click_gap": 0.04,
         "hotkey": {"enabled": True, "key": "f12", "ctrl": True},
         # 语音输入用哪个组合键（Windows 语音输入默认 Win+H）
@@ -641,10 +919,14 @@ def default_config():
             },
         },
         "buttons": {
-            "0": {"action": "mouse_left", "mode": "tap", "hz": 20, "key": ""},
+            # A = 鼠标左键。用「按住不放」：快点一下 = 单击，长按 = 左键保持按下（拖拽/框选）。
+            # 不要用 tap：tap 只在按下那一瞬间点一下，按住不会有任何持续效果。
+            "0": {"action": "mouse_left", "mode": "hold", "hz": 20, "key": ""},
             "1": {"action": "mouse_right", "mode": "tap", "hz": 20, "key": ""},
             "2": {"action": "mouse_double", "mode": "tap", "hz": 20, "key": ""},
-            "3": {"action": "mouse_middle", "mode": "tap", "hz": 20, "key": ""},
+            # Y = 键盘退格。用「连发」而不是「按住不放」：SendInput 注入的按键不会触发
+            # Windows 自动重复，光按住只会删一格；连发才能「长按连续删除」。
+            "3": {"action": "key", "mode": "rapid", "hz": 20, "key": "backspace"},
             "4": {"action": "key", "mode": "tap", "hz": 20, "key": "esc"},
             "5": {"action": "key", "mode": "tap", "hz": 20, "key": "r"},
             "6": {"action": "toggle", "mode": "tap", "hz": 20, "key": ""},
@@ -734,6 +1016,27 @@ class Engine(object):
         except (TypeError, ValueError):
             hz = 20.0
         return max(0.5, min(hz, MAX_RAPID_HZ))
+
+    def _rapid_delay(self, m):
+        """连发「启动延迟」(秒)：用来区分「点一下」和「按住」。
+
+        SendInput 注入的按键不会触发 Windows 自动重复，所以"长按连续输入"只能靠连发补发。
+        但连发若是按下即开始，一次快速点按（几十毫秒）也会补发 2~3 次
+        —— 表现为"只点一下却删了 3 个字母"。
+        因此按下后先等 delay 秒（这段只发第一次），超过 delay 才进入连发。
+        delay 可用全局 rapid_delay 配置，也能被某一行的 delay 覆盖；
+        显式设为 0（或负数）则退化成旧的"按下即连发"。
+        """
+        try:
+            d = m.get("delay")
+            if d is None:
+                d = self.cfg.get("rapid_delay", RAPID_HOLD_DELAY)
+            d = float(d)
+        except (TypeError, ValueError):
+            d = RAPID_HOLD_DELAY
+        if d <= 0:
+            return 1.0 / self._rapid_hz(m)
+        return min(d, 3.0)
 
     def _say(self, msg):
         if self.log:
@@ -879,10 +1182,12 @@ class Engine(object):
             self._press_hold(action, m)
             self._down_state[idx] = True
         elif mode == "rapid":
-            # 按下立刻发一次，并把「下次触发时间」推到下一个周期之后。
-            # 若这里写成 now，同一帧末尾的连发结算会判定 now>=next 再补发一次，
-            # 导致每次按下第一帧都双发（连发频率整体偏快一拍）。
-            self._rapid_next[idx] = now + 1.0 / self._rapid_hz(m)
+            # 按下立刻发一次，然后**先等「启动延迟」再进入连发**：
+            #   点一下(短于 delay)  -> 只发一次（不会一点就删 3 个）
+            #   按住(超过 delay)    -> 之后按 hz 连续触发
+            # 顺带避开旧的"第一帧双发"问题：只要 delay>0，本帧末尾的连发结算
+            # 就不会满足 now>=next，自然不会再补发一次。
+            self._rapid_next[idx] = now + self._rapid_delay(m)
             self._fire(action, m)
 
     def _on_release(self, idx, m, action, mode):
@@ -1082,6 +1387,51 @@ class Engine(object):
             self._scroll_acc -= steps
 
 
+# --- 系统层设备重置 ---------------------------------------------------------
+# 手柄待机/睡死之后，Windows 里的设备节点可能卡住：SDL 枚举不到、XInput 也看不见，
+# 这时程序怎么重建都没用（重启软件也一样）。唯一的办法是让系统把手柄设备
+# 重新加载一次 —— 等价于拔下来再插上去。这一步需要管理员权限，所以用 UAC 提权。
+DEVICE_RESET_PS = r'''$ErrorActionPreference = "SilentlyContinue"
+$names = "XBOX|Xbox|手柄|Controller|\u6e38\u620f\u63a7\u5236\u5668"
+$devs = @()
+$devs += @(Get-PnpDevice -PresentOnly -Class XnaComposite)
+$devs += @(Get-PnpDevice -PresentOnly | Where-Object { $_.Class -eq "HIDClass" -and $_.FriendlyName -match $names })
+$devs = @($devs | Sort-Object InstanceId -Unique)
+if ($devs.Count -eq 0) { Write-Host "NODEV"; exit 1 }
+foreach ($d in $devs) {
+  Write-Host ("reset " + $d.InstanceId)
+  pnputil /restart-device "$($d.InstanceId)" | Out-Null
+}
+Start-Sleep -Milliseconds 1200
+Write-Host "DONE"
+'''
+
+
+def restart_gamepad_device():
+    """请求 Windows 重启手柄设备节点（需要管理员 → 会弹一次 UAC）。
+
+    返回 (ok, 给用户看的提示语)。
+    """
+    if os.name != "nt":
+        return False, "重置手柄驱动仅支持 Windows"
+    try:
+        import subprocess
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".ps1", prefix="gm_devreset_")
+        os.close(fd)
+        # 带 BOM 写出，避免 PowerShell 5.1 把中文读成乱码
+        with open(path, "w", encoding="utf-8-sig") as fh:
+            fh.write(DEVICE_RESET_PS)
+        inner = ("Start-Process -FilePath powershell -Verb RunAs -Wait "
+                 "-WindowStyle Hidden -ArgumentList '-NoProfile',"
+                 "'-ExecutionPolicy','Bypass','-File','%s'" % path)
+        subprocess.run(["powershell", "-NoProfile", "-Command", inner],
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True, "已请管理员重启手柄设备（若没反应，请确认 UAC 弹窗已允许）"
+    except Exception as exc:
+        return False, "重置手柄驱动失败：%s" % exc
+
+
 # ============================================================================
 # 7. 运行时状态（主循环 <-> Web 控制台 共享）
 # ============================================================================
@@ -1095,12 +1445,14 @@ class Runtime(object):
         self.pad = Gamepad()
         self.engine = Engine(cfg)
         self.device = {"name": "", "connected": False,
-                       "nbuttons": 0, "naxes": 0, "nhats": 0, "index": 0}
+                       "nbuttons": 0, "naxes": 0, "nhats": 0, "index": 0,
+                       "stale": False, "recovers": 0, "xinput": False}
         self.devices = []
         self.pressed = []
         self.axes = []
         self.hats = []
         self.error = ""
+        self.pad_note = ""       # 手柄自愈过程中的提示（假连接 / 重连中）
         self.dirty_rows = set()
         import queue
         self.cmds = queue.Queue()
@@ -1111,11 +1463,15 @@ class Runtime(object):
             self.devices = list(pad.names)
             self.device = {"name": pad.name, "connected": pad.connected,
                            "nbuttons": pad.nbuttons, "naxes": pad.naxes,
-                           "nhats": pad.nhats, "index": pad.index}
+                           "nhats": pad.nhats, "index": pad.index,
+                           "stale": bool(pad.stale),
+                           "recovers": int(pad.recover_count),
+                           "xinput": bool(pad.xinput.available)}
             self.pressed = [i for i, v in pad.buttons.items() if v]
             self.axes = [round(float(a), 3) for a in pad.axes]
             self.hats = [list(h) for h in pad.hats]
             self.error = pad.error if not pad.available else ""
+            self.pad_note = pad.last_error or ""
 
     def drain_commands(self):
         while True:
@@ -1132,6 +1488,18 @@ class Runtime(object):
                 self.engine.toggle_enabled(bool(cmd.get("value")))
             elif kind == "rescan":
                 self.pad.rescan()
+            elif kind == "resetpad":
+                # 「重连手柄」：把 SDL 手柄子系统整个重建并重新打开
+                self.pad.deep_reset()
+                self.dirty_rows.add("all")
+            elif kind == "resetdevice":
+                # 「重置手柄驱动」：让 Windows 重启设备节点（等价于拔插一次），
+                # 会弹一次 UAC；这一步只救"系统层卡死"的情况
+                ok, msg = restart_gamepad_device()
+                self.pad.last_error = msg
+                if ok:
+                    self.pad.deep_reset()
+                self.dirty_rows.add("all")
             elif kind == "open":
                 self.pad.open(int(cmd.get("index", 0)))
                 self.dirty_rows.add("all")
@@ -1285,10 +1653,17 @@ td.tight{padding:4px 6px}
       <h2>手柄设备</h2>
       <div class="dev" id="devname">检测中…</div>
       <div class="meta" id="devmeta"></div>
+      <div id="devwarn" class="warn" style="display:none;margin-top:10px"></div>
       <div class="row" style="margin-top:10px">
         <select id="devsel" style="flex:1"></select>
         <button onclick="post('rescan',{})">重新扫描</button>
       </div>
+      <div class="row">
+        <button onclick="post('resetpad',{})">重连手柄</button>
+        <button class="danger" onclick="resetDevice()">重置手柄驱动…</button>
+      </div>
+      <div class="hint">待机 / 睡眠唤醒后手柄没反应时：先点「重连手柄」；
+        还不行再点「重置手柄驱动…」（会弹 UAC，需管理员，相当于拔插一次手柄）。</div>
       <div class="live" id="live">按下手柄按钮以查看实时状态</div>
     </div>
 
@@ -1343,8 +1718,12 @@ td.tight{padding:4px 6px}
     <div class="card">
       <h2>连点 / 连发</h2>
       <div class="row"><label>默认频率</label><input type="range" id="hz" min="1" max="100" step="1"><span class="val" id="hzv"></span></div>
+      <div class="row"><label>长按启动延迟</label><input type="range" id="rdel" min="0" max="1000" step="20"><span class="val" id="rdelv"></span></div>
       <div class="row"><label>双击间隔</label><input type="range" id="gap" min="10" max="200" step="5"><span class="val" id="gapv"></span></div>
-      <div class="hint">「连发」= 按住不放时按该频率无限触发。范围 <b>0.5~100</b> 次/秒，可以填小数（如 1.2 = 每 0.83 秒一次）。</div>
+      <div class="hint">「连发」= 按住不放时按该频率无限触发。范围 <b>0.5~100</b> 次/秒，可以填小数（如 1.2 = 每 0.83 秒一次）。<br>
+        <b>长按启动延迟</b>：按下后先等这么久才开始连发 —— 在延迟内松手只触发 <b>1 次</b>（点一下 = 按一下），
+        按住超过延迟才连续触发。觉得「点一下却触发好几次（如删了 3 个字）」就把它<b>调大</b>；
+        嫌长按起动慢就调小；<b>0</b> = 按下立刻开始连发（旧行为）。</div>
     </div>
 
     <div class="card">
@@ -1406,6 +1785,13 @@ function toast(m){const t=document.getElementById('toast');t.textContent=m;
 function post(cmd, extra){
   fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(Object.assign({cmd:cmd},extra))}).catch(()=>{});
+}
+
+/* 重置手柄驱动：让 Windows 重启设备节点（需要管理员，会弹 UAC） */
+function resetDevice(){
+  if(!confirm('将请求管理员权限，重启 Windows 里的手柄设备（相当于拔下来再插上）。\n\n只在「重连手柄」也救不回来时才需要。\n\n继续？')) return;
+  post('resetdevice',{});
+  toast('已请求重置手柄驱动，请在 UAC 弹窗中允许');
 }
 
 /* ---------- 表格 ---------- */
@@ -1537,13 +1923,24 @@ async function tick(){
     else document.getElementById('warnbox').innerHTML = '';
 
     // 设备
-    if(s.device.connected){
-      document.getElementById('devname').textContent = '● ' + s.device.name;
+    const dev = s.device, wbox = document.getElementById('devwarn');
+    if(dev.connected){
+      document.getElementById('devname').textContent =
+        (dev.stale ? '◐ ' : '● ') + dev.name;
       document.getElementById('devmeta').textContent =
-        '按钮 '+s.device.nbuttons+' · 摇杆 '+s.device.naxes+' · 十字键 '+s.device.nhats;
+        '按钮 '+dev.nbuttons+' · 摇杆 '+dev.naxes+' · 十字键 '+dev.nhats
+        + (dev.recovers ? ' · 已自愈 '+dev.recovers+' 次' : '');
     }else{
       document.getElementById('devname').textContent = '○ 未检测到手柄';
       document.getElementById('devmeta').textContent = '插上手柄后点「重新扫描」';
+    }
+    if(dev.connected && dev.stale){
+      wbox.style.display = '';
+      wbox.innerHTML = '<b>手柄「假连接」</b>：系统里还挂着设备，但收不到任何输入，程序正在自动重连…'
+        + (s.pad_note ? '<br>'+esc(s.pad_note) : '')
+        + '<br>若一直不恢复：点「重置手柄驱动…」；或把手柄拔下重插 / 按一下 Xbox 键唤醒。';
+    }else{
+      wbox.style.display = 'none';
     }
     const ds = document.getElementById('devsel');
     if(s.devices.join('|') !== ds.dataset.sig){
@@ -1615,6 +2012,7 @@ function applyCfg(c){
   setRange('rdead','rdeadv', rg.deadzone!==undefined?rg.deadzone:0.18, 2);
   document.getElementById('rinvy').checked = !!rg.invert_y;
   setRange('hz','hzv',c.rapid_hz||20,0);
+  setRange('rdel','rdelv',(c.rapid_delay!==undefined?c.rapid_delay:0.4)*1000,0,' ms');
   setRange('gap','gapv',(c.double_click_gap||0.04)*1000,0);
   const sc = (c.mouse&&c.mouse.scroll)||{};
   setRange('scspd','scspdv', sc.speed!==undefined?sc.speed:6, 1);
@@ -1634,6 +2032,7 @@ function bindCfg(){
     post('config',{value:{
       enabled: STATE?STATE.enabled:true,
       rapid_hz: parseFloat(document.getElementById('hz').value),
+      rapid_delay: parseFloat(document.getElementById('rdel').value)/1000,
       double_click_gap: parseFloat(document.getElementById('gap').value)/1000,
       hotkey:{enabled: document.getElementById('cbHotkey').checked, key:'f12', ctrl:true},
       voice_hotkey: (document.getElementById('voicekey').value||'win+h').trim(),
@@ -1666,6 +2065,7 @@ function bindCfg(){
     document.getElementById(vid).textContent = Number(e.target.value).toFixed(dec)+(suffix||'');
   });
   live('sens','sensv',0); live('dead','deadv',2); live('hz','hzv',0,' Hz'); live('gap','gapv',0,' ms');
+  live('rdel','rdelv',0,' ms');
   live('rsens','rsensv',0); live('rdead','rdeadv',2);
   live('scspd','scspdv',1,' 格/秒'); live('scdead','scdeadv',2);
   live('scexp','scexpv',1); live('scsm','scsmv',2);
@@ -1760,6 +2160,7 @@ def run_web(rt, port=DEFAULT_PORT, open_browser=True):
                         "axes": rt.axes,
                         "hats": rt.hats,
                         "error": rt.error,
+                        "pad_note": rt.pad_note,
                         "rows": rt.rows_payload(),
                         "stats": dict(rt.engine.sim.stats),
                         "scroll_rate": round(rt.engine.scroll_rate, 2),
@@ -1812,17 +2213,15 @@ def run_web(rt, port=DEFAULT_PORT, open_browser=True):
 
     # ---- 主循环（pygame 必须在主线程轮询）----
     rt.engine.start()
-    last_rescan = time.time()
+    sup = {"last_input": time.time()}      # 手柄守护用的计时/重试状态
     try:
         while not rt.quit:
             rt.drain_commands()
             rt.pad.poll()
-            if not rt.pad.connected:
-                t = time.time()
-                if t - last_rescan > 2.0:
-                    last_rescan = t
-                    rt.pad.rescan()
-                    rt.dirty_rows.add("all")
+            if pad_input_seen(rt.pad):
+                sup["last_input"] = time.time()
+            if supervise_pad(rt.pad, sup):
+                rt.dirty_rows.add("all")
             rt.engine.update(rt.pad.buttons, rt.pad.axes, rt.pad.hats)
             rt.publish()
             time.sleep(0.004)
@@ -1858,11 +2257,13 @@ def run_nogui(cfg):
     eng.log = lambda m: print("[%s] %s" % (time.strftime("%H:%M:%S"), m))
     eng.start()
     print("映射运行中。Ctrl+F12 开关映射，Ctrl+C 退出。")
+    sup = {"last_input": time.time()}
     try:
         while True:
             pad.poll()
-            if not pad.connected and pad.available:
-                pad.rescan()
+            if pad_input_seen(pad):
+                sup["last_input"] = time.time()
+            supervise_pad(pad, sup)
             eng.update(pad.buttons, pad.axes, pad.hats)
             time.sleep(0.004)
     except KeyboardInterrupt:
@@ -1926,8 +2327,8 @@ HELP = """\
   python gamepad_mapper.py --no-browser   启动但不自动打开浏览器
 
 默认映射（XBox 布局，可在控制台里任意改）：
-  按钮0(A)   鼠标左键（单点）             按钮1(B)   鼠标右键
-  按钮2(X)   鼠标双击                     按钮3(Y)   鼠标中键
+  按钮0(A)   鼠标左键（点一下=单击，按住=按住不放）  按钮1(B)   鼠标右键
+  按钮2(X)   鼠标双击                     按钮3(Y)   键盘 BACKSPACE（退格/删除）
   按钮4(LB)  键盘 ESC                     按钮5(RB)  键盘 R
   按钮6(返回) 开关映射                    按钮7(开始) 语音输入（Win+H）
   按钮8(LS)  键盘 TAB                     按钮9(RS)  键盘 ENTER
